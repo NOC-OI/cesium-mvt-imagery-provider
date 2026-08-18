@@ -1,9 +1,11 @@
-import { Cartesian3, Color } from "cesium";
+import { Cartesian3, Color, Ion } from "cesium";
 import { Viewer, Entity } from "resium";
 
 import { Imagery } from "./Imagery";
 
 function App() {
+  Ion.defaultAccessToken =
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiIwMDNjYzU4OC04NDYzLTRhY2EtYTJiMS02ZmEzOWRhZGU0NTciLCJpZCI6MzYzNzkyLCJpYXQiOjE3NjQwODIzNDh9.45UPeFvrmPkH07McAipCx3df2_dvJWrEUVEKoi_gkSg";
   return (
     <Viewer full>
       <Entity

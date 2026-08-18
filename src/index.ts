@@ -29,17 +29,36 @@ const defaultParseTile = async (url?: string, headers?: any) => {
 const defaultPickPointRadius = 5;
 const defaultPickLineWidth = 5;
 
-type TileCoordinates = {
+export type TileCoordinates = {
   x: number;
   y: number;
   level: number;
 };
 
-type Style = {
+export type PointIcon = string | CanvasImageSource;
+
+export type PointIconSize =
+  | number
+  | {
+      width?: number;
+      height?: number;
+    };
+
+export type Style = {
   fillStyle?: string;
   strokeStyle?: string;
   lineWidth?: number;
   lineJoin?: CanvasLineJoin;
+  /** Radius in canvas pixels for point features. */
+  pointRadius?: number;
+  /** SVG/PNG URL or an already loaded CanvasImageSource for point features. */
+  icon?: PointIcon;
+  /** Icon width/height. A number produces a square icon; one omitted dimension preserves aspect ratio. */
+  iconSize?: PointIconSize;
+  /** Normalized icon anchor, where [0.5, 0.5] is centered and [0.5, 1] is bottom-center. */
+  iconAnchor?: [number, number];
+  /** `crossOrigin` used when loading an icon URL. Defaults to `anonymous`; use null to omit it. */
+  iconCrossOrigin?: string | null;
 };
 
 type URLTemplate = `${`http${"s" | ""}://` | ""}${string}/{z}/{x}/{y}${string}`;
@@ -62,6 +81,10 @@ export type ImageryProviderOption = {
   parseTile?: (url?: string) => Promise<VectorTile | undefined>;
   pickPointRadius?: number | FeatureHandler<number>;
   pickLineWidth?: number | FeatureHandler<number>;
+  /** Render points from adjacent tiles so markers can cross tile boundaries. */
+  renderPointNeighbors?: boolean;
+  /** Maximum marker overflow, in canvas pixels, considered when rendering adjacent tiles. */
+  pointRenderBuffer?: number;
 };
 
 type ImageryProviderTrait = ImageryProvider;
@@ -85,6 +108,8 @@ export class CesiumMVTImageryProvider implements ImageryProviderTrait {
   private _parseTile: (url?: string, headers?: any) => Promise<VectorTile | undefined>;
   private _pickPointRadius: number | FeatureHandler<number>;
   private _pickLineWidth: number | FeatureHandler<number>;
+  private readonly _renderPointNeighbors: boolean;
+  private readonly _pointRenderBuffer: number;
 
   // Internal variables
   private readonly _tilingScheme: WebMercatorTilingScheme;
@@ -95,6 +120,7 @@ export class CesiumMVTImageryProvider implements ImageryProviderTrait {
   private readonly _readyPromise: Promise<boolean>;
   private readonly _errorEvent = new CesiumEvent();
   private readonly _tileCaches = new Map<string, VectorTile>();
+  private readonly _iconCache = new Map<string, Promise<HTMLImageElement | undefined>>();
 
   constructor(options: ImageryProviderOption) {
     this._minimumLevel = options.minimumLevel ?? 0;
@@ -111,6 +137,8 @@ export class CesiumMVTImageryProvider implements ImageryProviderTrait {
     this._parseTile = options.parseTile ?? defaultParseTile;
     this._pickPointRadius = options.pickPointRadius ?? defaultPickPointRadius;
     this._pickLineWidth = options.pickLineWidth ?? defaultPickLineWidth;
+    this._renderPointNeighbors = options.renderPointNeighbors ?? false;
+    this._pointRenderBuffer = Math.max(0, options.pointRenderBuffer ?? 32);
 
     this._tilingScheme = new WebMercatorTilingScheme();
 
@@ -234,9 +262,9 @@ export class CesiumMVTImageryProvider implements ImageryProviderTrait {
     layerName: string,
     scaleFactor: number,
   ): Promise<HTMLCanvasElement> {
-    if (!this._currentUrl) return canvas;
-
-    const tile = await this._cachedTile(this._currentUrl);
+    const tile = await this._cachedTile(
+      buildURLWithTileCoordinates(this._urlTemplate, requestedTile),
+    );
 
     const layerNames = layerName.split(/, */).filter(Boolean);
     const layers = layerNames.map(ln => tile?.layers[ln]);
@@ -263,8 +291,8 @@ export class CesiumMVTImageryProvider implements ImageryProviderTrait {
       0,
     );
 
-    layers.forEach(layer => {
-      if (!layer) return;
+    for (const layer of layers) {
+      if (!layer) continue;
       // Vector tile works with extent [0, 4095], but canvas is only [0,255]
       const extentFactor = CESIUM_CANVAS_SIZE / layer.extent;
 
@@ -288,7 +316,7 @@ export class CesiumMVTImageryProvider implements ImageryProviderTrait {
         if (VectorTileFeature.types[feature.type] === "Polygon") {
           this._renderPolygon(context, feature, extentFactor, (style.lineWidth ?? 1) > 0);
         } else if (VectorTileFeature.types[feature.type] === "Point") {
-          this._renderPoint(context, feature, extentFactor);
+          await this._renderPoint(context, feature, extentFactor, style);
         } else if (VectorTileFeature.types[feature.type] === "LineString") {
           this._renderLineString(context, feature, extentFactor);
         } else {
@@ -301,11 +329,63 @@ export class CesiumMVTImageryProvider implements ImageryProviderTrait {
           );
         }
       }
-    });
+    }
+
+    if (this._renderPointNeighbors && this._pointRenderBuffer > 0) {
+      await this._renderNeighborPoints(context, requestedTile, layerName);
+    }
 
     this._onFeaturesRendered?.();
 
     return canvas;
+  }
+
+  async _renderNeighborPoints(
+    context: CanvasRenderingContext2D,
+    requestedTile: TileCoordinates,
+    layerName: string,
+  ): Promise<void> {
+    const tileCount = 2 ** requestedTile.level;
+    const neighbors = neighborTileCoordinates(requestedTile, tileCount);
+    const loadedNeighbors = await Promise.all(
+      neighbors.map(async neighbor => ({
+        ...neighbor,
+        tile: await this._cachedTile(
+          buildURLWithTileCoordinates(this._urlTemplate, neighbor.tileCoords),
+        ),
+      })),
+    );
+
+    for (const neighbor of loadedNeighbors) {
+      const layer = neighbor.tile?.layers[layerName];
+      if (!layer) continue;
+      const extentFactor = CESIUM_CANVAS_SIZE / layer.extent;
+
+      for (let i = 0; i < layer.length; i++) {
+        const feature = layer.feature(i);
+        if (VectorTileFeature.types[feature.type] !== "Point") continue;
+        if (this._onRenderFeature && !this._onRenderFeature(feature, neighbor.tileCoords)) {
+          continue;
+        }
+
+        const style = this._style?.(feature, neighbor.tileCoords);
+        if (!style) continue;
+        context.fillStyle = style.fillStyle ?? context.fillStyle;
+        context.strokeStyle = style.strokeStyle ?? context.strokeStyle;
+        context.lineWidth = style.lineWidth ?? context.lineWidth;
+        context.lineJoin = style.lineJoin ?? context.lineJoin;
+
+        await this._renderPoint(
+          context,
+          feature,
+          extentFactor,
+          style,
+          neighbor.offsetX * CESIUM_CANVAS_SIZE,
+          neighbor.offsetY * CESIUM_CANVAS_SIZE,
+          this._pointRenderBuffer,
+        );
+      }
+    }
   }
 
   _renderPolygon(
@@ -336,26 +416,73 @@ export class CesiumMVTImageryProvider implements ImageryProviderTrait {
     context.fill();
   }
 
-  _renderPoint(
+  async _renderPoint(
     context: CanvasRenderingContext2D,
     feature: VectorTileFeature,
     extentFactor: number,
-  ) {
+    style: Style,
+    offsetX = 0,
+    offsetY = 0,
+    renderBuffer?: number,
+  ): Promise<void> {
     context.beginPath();
 
     const coordinates = feature.loadGeometry();
 
     for (let i2 = 0; i2 < coordinates.length; i2++) {
       const pos = coordinates[i2][0];
-      const [x, y] = [pos.x * extentFactor, pos.y * extentFactor];
+      const [x, y] = [pos.x * extentFactor + offsetX, pos.y * extentFactor + offsetY];
+      if (
+        renderBuffer !== undefined &&
+        (x < -renderBuffer ||
+          x > CESIUM_CANVAS_SIZE + renderBuffer ||
+          y < -renderBuffer ||
+          y > CESIUM_CANVAS_SIZE + renderBuffer)
+      ) {
+        continue;
+      }
 
-      // Handle lineWidth as radius
-      const radius = context.lineWidth;
+      const icon = await this._resolveIcon(style.icon, style.iconCrossOrigin);
+      if (icon) {
+        const [width, height] = iconDimensions(icon, style.iconSize);
+        const [anchorX, anchorY] = style.iconAnchor ?? [0.5, 0.5];
+        context.drawImage(icon, x - width * anchorX, y - height * anchorY, width, height);
+        continue;
+      }
+
+      // Keep lineWidth as the fallback radius for backwards compatibility.
+      const radius = style.pointRadius ?? context.lineWidth;
 
       context.beginPath();
       context.arc(x, y, radius, 0, 2 * Math.PI);
       context.fill();
     }
+  }
+
+  _resolveIcon(
+    icon: PointIcon | undefined,
+    crossOrigin: string | null = "anonymous",
+  ): Promise<CanvasImageSource | undefined> {
+    if (!icon || typeof icon !== "string") {
+      return Promise.resolve(icon as CanvasImageSource | undefined);
+    }
+
+    const cacheKey = `${crossOrigin ?? ""}:${icon}`;
+    const cached = this._iconCache.get(cacheKey);
+    if (cached) return cached;
+
+    const loading = new Promise<HTMLImageElement | undefined>(resolve => {
+      const image = new Image();
+      if (crossOrigin !== null) image.crossOrigin = crossOrigin;
+      image.onload = () => resolve(image);
+      image.onerror = () => {
+        console.warn(`Could not load point icon: ${icon}`);
+        resolve(undefined);
+      };
+      image.src = icon;
+    });
+    this._iconCache.set(cacheKey, loading);
+    return loading;
   }
 
   _renderLineString(
@@ -558,6 +685,55 @@ function featureHandlerOrNumber(
     return f;
   }
   return f(feature, tileCoords);
+}
+
+function iconDimensions(icon: CanvasImageSource, size?: PointIconSize): [number, number] {
+  const source = icon as CanvasImageSource & {
+    naturalWidth?: number;
+    naturalHeight?: number;
+    videoWidth?: number;
+    videoHeight?: number;
+    width?: number;
+    height?: number;
+  };
+  const intrinsicWidth = source.naturalWidth ?? source.videoWidth ?? source.width ?? 24;
+  const intrinsicHeight = source.naturalHeight ?? source.videoHeight ?? source.height ?? 24;
+
+  if (typeof size === "number") return [size, size];
+  if (!size) return [intrinsicWidth, intrinsicHeight];
+  if (size.width !== undefined && size.height !== undefined) return [size.width, size.height];
+  if (size.width !== undefined) {
+    return [size.width, size.width * (intrinsicHeight / intrinsicWidth)];
+  }
+  if (size.height !== undefined) {
+    return [size.height * (intrinsicWidth / intrinsicHeight), size.height];
+  }
+  return [intrinsicWidth, intrinsicHeight];
+}
+
+function neighborTileCoordinates(
+  requestedTile: TileCoordinates,
+  tileCount: number,
+): Array<{ tileCoords: TileCoordinates; offsetX: number; offsetY: number }> {
+  const neighbors: Array<{ tileCoords: TileCoordinates; offsetX: number; offsetY: number }> = [];
+
+  for (let offsetY = -1; offsetY <= 1; offsetY++) {
+    const y = requestedTile.y + offsetY;
+    if (y < 0 || y >= tileCount) continue;
+
+    for (let offsetX = -1; offsetX <= 1; offsetX++) {
+      if (offsetX === 0 && offsetY === 0) continue;
+      const unwrappedX = requestedTile.x + offsetX;
+      const x = ((unwrappedX % tileCount) + tileCount) % tileCount;
+      neighbors.push({
+        tileCoords: { x, y, level: requestedTile.level },
+        offsetX,
+        offsetY,
+      });
+    }
+  }
+
+  return neighbors;
 }
 
 export default CesiumMVTImageryProvider;

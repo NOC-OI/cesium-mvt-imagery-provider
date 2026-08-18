@@ -6,21 +6,23 @@ jobs:
   lib:
     name: lib
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-      - name: Get yarn cache directory path
-        id: yarn-cache-dir-path
-        run: echo "path=$(yarn cache dir)" >> $GITHUB_OUTPUT
-      - uses: actions/cache@v3
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
         with:
-          path: ${{ steps.yarn-cache-dir-path.outputs.path }}
-          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-yarn-
+          node-version: 22
+          cache: npm
+
       - name: Run install
-        run: yarn install --frozen-lockfile
+        run: npm ci
+
       - name: Run lint
-        run: yarn lint
+        run: npm run lint
+
+      - name: Run type check
+        run: npm run type
+
       - name: Run build
-        run: yarn build
+        run: npm run build
